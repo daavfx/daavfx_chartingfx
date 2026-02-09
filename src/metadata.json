@@ -1,0 +1,5 @@
+{
+  "name": "DAAVFX Trade Replay",
+  "description": "A high-performance trading replay and vault application built with React, TypeScript, and Lightweight Charts, optimized for Tauri.",
+  "requestFramePermissions": []
+}
