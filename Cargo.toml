@@ -1,0 +1,45 @@
+[package]
+name = "charting-app"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Charting FX App - Visual market replay and analysis"
+
+[dependencies]
+# Core engine
+daavfx-core = { path = "../daavfx-core" }
+
+# Tauri
+tauri = { version = "1.6", features = ["shell-open", "dialog"] }
+tauri-plugin-shell = "1.0"
+tauri-plugin-dialog = "1.0"
+
+# Async runtime
+tokio = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Error handling
+anyhow = "1.0"
+thiserror = { workspace = true }
+
+# Tracing
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Time
+chrono = { workspace = true }
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
+[profile.release]
+panic = "abort"
+ codegen-units = 1
+lto = true
+opt-level = 3
+strip = true
