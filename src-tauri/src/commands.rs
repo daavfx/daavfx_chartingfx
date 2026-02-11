@@ -1,101 +1,314 @@
-use tauri::command;
-use serde::{Serialize, Deserialize};
-use std::path::PathBuf;
-use crate::data::{TerminalInfo, SymbolInfo, DateRange, DownloadResult};
-use crate::reporting::{BacktestStats, MonteCarloStats};
+//! Simplified commands for charting_daavfx
 
-#[command]
-pub fn detect_terminals() -> Vec<TerminalInfo> {
-    // Mock implementation
-    vec![
-        TerminalInfo {
-            name: "MT5 Terminal 1".to_string(),
-            data_path: "C:\\MetaQuotes\\Terminal\\...".to_string(),
-            custom_symbols_path: "C:\\MetaQuotes\\Terminal\\...\\Custom".to_string(),
-            is_default: true,
-        }
-    ]
+use crate::AppState;
+use crate::replay::{ReplayInfo, ReplayUpdate};
+use daavfx_core::OHLCV;
+use tauri::State;
+
+#[tauri::command]
+pub fn get_app_info() -> String {
+    "Charting DAAVFX v1.0".to_string()
 }
 
-#[command]
-pub fn get_available_symbols() -> Vec<SymbolInfo> {
-    // Mock implementation
-    vec![
-        SymbolInfo { name: "EURUSD".to_string(), display_name: "Euro vs US Dollar".to_string(), category: "Forex".to_string() },
-        SymbolInfo { name: "GBPUSD".to_string(), display_name: "Great Britain Pound vs US Dollar".to_string(), category: "Forex".to_string() },
-        SymbolInfo { name: "XAUUSD".to_string(), display_name: "Gold vs US Dollar".to_string(), category: "Metals".to_string() },
-    ]
+#[tauri::command]
+pub fn get_available_symbols(state: State<'_, AppState>) -> Vec<String> {
+    state.core.get_symbols()
 }
 
-#[command]
-pub fn get_date_range(_symbol: String) -> DateRange {
-    DateRange {
-        start: "2023-01-01".to_string(),
-        end: "2023-12-31".to_string(),
-    }
+#[tauri::command]
+pub fn get_cache_stats(state: State<'_, AppState>) -> String {
+    let stats = state.core.cache_stats();
+    format!("Entries: {}, Total candles: {}", stats.0, stats.1)
 }
 
-#[derive(Deserialize)]
-pub struct DownloadParams {
+#[tauri::command]
+pub fn clear_cache(state: State<'_, AppState>) {
+    state.core.clear_cache();
+}
+
+#[tauri::command]
+pub async fn import_csv_data(
+    state: State<'_, AppState>,
+    file_path: String,
     symbol: String,
-    start_date: String,
-    end_date: String,
-}
+) -> Result<usize, String> {
+    use std::fs::File;
+    use std::io::{BufRead, BufReader};
 
-#[command]
-pub async fn download_tick_data(_params: DownloadParams) -> DownloadResult {
-    // Mock async operation
-    tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
-    DownloadResult {
-        success: true,
-        tick_count: 100000,
-        message: "Downloaded successfully".to_string(),
-        output_path: Some("C:\\Data\\ticks.csv".to_string()),
+    let file = File::open(&file_path).map_err(|e| e.to_string())?;
+    let reader = BufReader::new(file);
+    let mut data = Vec::new();
+
+    for line in reader.lines() {
+        let line = line.map_err(|e| e.to_string())?;
+        let parts: Vec<&str> = line.split(',').collect();
+        if parts.len() >= 6 {
+            if let Ok(time) = parts[0].parse::<i64>() {
+                if let Ok(open) = parts[1].parse::<f64>() {
+                    if let Ok(high) = parts[2].parse::<f64>() {
+                        if let Ok(low) = parts[3].parse::<f64>() {
+                            if let Ok(close) = parts[4].parse::<f64>() {
+                                data.push(OHLCV {
+                                    time,
+                                    open,
+                                    high,
+                                    low,
+                                    close,
+                                    volume: 0,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
+
+    state.core.save_ohlcv(&symbol, &data);
+    Ok(data.len())
 }
 
-#[command]
-pub fn get_download_status() -> u32 {
-    100
+#[tauri::command]
+pub async fn load_ohlcv_data(
+    state: State<'_, AppState>,
+    symbol: String,
+) -> Result<Vec<OHLCVResponse>, String> {
+    let data = state.core.get_ohlcv(&symbol);
+    let data = match data {
+        Some(d) => d,
+        None => return Ok(Vec::new()),
+    };
+
+    let response: Vec<OHLCVResponse> = data.iter().map(|c| OHLCVResponse {
+        time: c.time,
+        open: c.open.to_string(),
+        high: c.high.to_string(),
+        low: c.low.to_string(),
+        close: c.close.to_string(),
+        volume: c.volume.to_string(),
+    }).collect();
+
+    Ok(response)
 }
 
-#[command]
-pub fn cancel_download() {
-    // No-op
+#[derive(serde::Serialize)]
+pub struct OHLCVResponse {
+    pub time: i64,
+    pub open: String,
+    pub high: String,
+    pub low: String,
+    pub close: String,
+    pub volume: String,
 }
 
-#[derive(Deserialize)]
-pub struct BacktestParams {
-    ticks_path: String,
-    initial_balance: f64,
+#[tauri::command]
+pub async fn load_replay_session(
+    state: State<'_, AppState>,
+    symbol: String,
+    timeframe: String,
+) -> Result<ReplayInfo, String> {
+    let data = state.core.get_ohlcv(&symbol);
+    let data = match data {
+        Some(d) => d,
+        None => return Err("No data found".to_string()),
+    };
+
+    let mut replay = state.replay_state.lock().unwrap();
+    replay.symbol = symbol.clone();
+    replay.data = data;
+    replay.current_index = 0;
+    replay.speed = 1.0;
+    replay.is_playing = false;
+
+    Ok(ReplayInfo {
+        total_candles: replay.data.len(),
+        current_index: 0,
+        start_time: replay.data[0].time,
+        end_time: replay.data[replay.data.len() - 1].time,
+        symbol,
+        timeframe,
+        is_playing: false,
+        speed: 1.0,
+    })
 }
 
-#[command]
-pub async fn start_visual_backtest(_params: BacktestParams) -> BacktestStats {
-    BacktestStats {
-        total_trades: 50,
-        win_rate: 0.6,
-        profit_factor: 1.5,
-        net_profit: 500.0,
-        max_drawdown: 100.0,
-        sharpe_ratio: 1.2,
+#[tauri::command]
+pub async fn start_replay(state: State<'_, AppState>) -> Result<(), String> {
+    let mut replay = state.replay_state.lock().unwrap();
+    if replay.data.is_empty() {
+        return Err("No replay session loaded".to_string());
     }
+    replay.is_playing = true;
+    Ok(())
 }
 
-#[derive(Deserialize)]
-pub struct MonteCarloParams {
-    ticks_path: String,
-    runs: u32,
-    initial_balance: f64,
+#[tauri::command]
+pub async fn pause_replay(state: State<'_, AppState>) -> Result<(), String> {
+    let mut replay = state.replay_state.lock().unwrap();
+    replay.is_playing = false;
+    Ok(())
 }
 
-#[command]
-pub async fn start_monte_carlo_optimization(_params: MonteCarloParams) -> MonteCarloStats {
-    MonteCarloStats {
-        confidence_95: 100.0,
-        confidence_99: 50.0,
-        median_profit: 600.0,
-        worst_case: -200.0,
-        ruin_probability: 0.01,
+#[tauri::command]
+pub async fn stop_replay(state: State<'_, AppState>) -> Result<(), String> {
+    let mut replay = state.replay_state.lock().unwrap();
+    replay.is_playing = false;
+    replay.current_index = 0;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn step_forward(
+    state: State<'_, AppState>,
+    steps: Option<usize>,
+) -> Result<ReplayUpdate, String> {
+    let steps = steps.unwrap_or(1);
+    let mut replay = state.replay_state.lock().unwrap();
+    
+    if replay.data.is_empty() {
+        return Err("No replay session".to_string());
     }
+    
+    replay.current_index = (replay.current_index + steps).min(replay.data.len() - 1);
+    replay.is_playing = false;
+    
+    let candle = &replay.data[replay.current_index];
+    
+    Ok(ReplayUpdate {
+        current_index: replay.current_index,
+        total_candles: replay.data.len(),
+        time: candle.time,
+        open: candle.open.to_string(),
+        high: candle.high.to_string(),
+        low: candle.low.to_string(),
+        close: candle.close.to_string(),
+        progress: replay.current_index as f64 / replay.data.len() as f64,
+    })
+}
+
+#[tauri::command]
+pub async fn step_backward(
+    state: State<'_, AppState>,
+    steps: Option<usize>,
+) -> Result<ReplayUpdate, String> {
+    let steps = steps.unwrap_or(1);
+    let mut replay = state.replay_state.lock().unwrap();
+    
+    if replay.data.is_empty() {
+        return Err("No replay session".to_string());
+    }
+    
+    replay.current_index = replay.current_index.saturating_sub(steps);
+    replay.is_playing = false;
+    
+    let candle = &replay.data[replay.current_index];
+    
+    Ok(ReplayUpdate {
+        current_index: replay.current_index,
+        total_candles: replay.data.len(),
+        time: candle.time,
+        open: candle.open.to_string(),
+        high: candle.high.to_string(),
+        low: candle.low.to_string(),
+        close: candle.close.to_string(),
+        progress: replay.current_index as f64 / replay.data.len() as f64,
+    })
+}
+
+#[tauri::command]
+pub async fn set_replay_speed(
+    state: State<'_, AppState>,
+    speed: f64,
+) -> Result<(), String> {
+    let mut replay = state.replay_state.lock().unwrap();
+    replay.speed = speed.clamp(0.1, 10.0);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn seek_to_index(
+    state: State<'_, AppState>,
+    index: usize,
+) -> Result<ReplayUpdate, String> {
+    let mut replay = state.replay_state.lock().unwrap();
+    
+    if replay.data.is_empty() {
+        return Err("No replay session".to_string());
+    }
+    
+    replay.current_index = index.min(replay.data.len() - 1);
+    replay.is_playing = false;
+    
+    let candle = &replay.data[replay.current_index];
+    
+    Ok(ReplayUpdate {
+        current_index: replay.current_index,
+        total_candles: replay.data.len(),
+        time: candle.time,
+        open: candle.open.to_string(),
+        high: candle.high.to_string(),
+        low: candle.low.to_string(),
+        close: candle.close.to_string(),
+        progress: replay.current_index as f64 / replay.data.len() as f64,
+    })
+}
+
+#[tauri::command]
+pub async fn get_replay_state(state: State<'_, AppState>) -> Result<ReplayStateResponse, String> {
+    let replay = state.replay_state.lock().unwrap();
+    
+    if replay.data.is_empty() {
+        return Ok(ReplayStateResponse {
+            is_loaded: false,
+            is_playing: false,
+            current_index: 0,
+            total_candles: 0,
+            speed: 1.0,
+            symbol: String::new(),
+            timeframe: String::new(),
+            progress: 0.0,
+        });
+    }
+    
+    Ok(ReplayStateResponse {
+        is_loaded: true,
+        is_playing: replay.is_playing,
+        current_index: replay.current_index,
+        total_candles: replay.data.len(),
+        speed: replay.speed,
+        symbol: replay.symbol.clone(),
+        timeframe: "".to_string(),
+        progress: replay.current_index as f64 / replay.data.len() as f64,
+    })
+}
+
+#[derive(serde::Serialize)]
+pub struct ReplayStateResponse {
+    pub is_loaded: bool,
+    pub is_playing: bool,
+    pub current_index: usize,
+    pub total_candles: usize,
+    pub speed: f64,
+    pub symbol: String,
+    pub timeframe: String,
+    pub progress: f64,
+}
+
+#[tauri::command]
+pub fn save_drawings(
+    _state: State<'_, AppState>,
+    _symbol: String,
+    _timeframe: String,
+    _drawings: String,
+) -> Result<(), String> {
+    Ok(())
+}
+
+#[tauri::command]
+pub fn load_drawings(
+    _state: State<'_, AppState>,
+    _symbol: String,
+    _timeframe: String,
+) -> Result<String, String> {
+    Ok("[]".to_string())
 }
